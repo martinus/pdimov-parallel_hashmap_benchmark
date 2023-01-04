@@ -27,7 +27,6 @@
 #include "oneapi/tbb/concurrent_hash_map.h"
 #include "gtl/phmap.hpp"
 
-int const Th = 24; // number of threads
 int const Sh = 512; // number of shards
 
 using namespace std::chrono_literals;
@@ -36,12 +35,36 @@ static void print_time( std::chrono::steady_clock::time_point & t1, char const* 
 {
     auto t2 = std::chrono::steady_clock::now();
 
-    std::cout << label << ": " << ( t2 - t1 ) / 1ms << " ms (s=" << s << ", size=" << size << ")\n";
+    // std::cout << label << ": " << ( t2 - t1 ) / 1ms << " ms (s=" << s << ", size=" << size << ")\n";
 
     t1 = t2;
 }
 
 static std::vector<std::string> words;
+
+static std::vector<std::string> load_preparsed_words(std::string const& filename) {
+    auto is = std::ifstream(filename);
+    if (!is.is_open()) {
+        return {};
+    }
+    std::string num_words;
+    std::getline(is, num_words);
+
+    auto my_words = std::vector<std::string>();
+    my_words.resize(std::stoull(num_words));
+    for (auto& word : my_words) {
+        std::getline(is, word);
+    }
+    return my_words;
+}
+
+static void save_preparsed_words(std::vector<std::string> const& words, std::string const& filename) {
+    auto os = std::ofstream(filename);
+    os << std::to_string(words.size()) << '\n';
+    for (auto const& word : words) {
+        os << word << '\n';
+    }
+}
 
 static void init_words()
 {
@@ -57,13 +80,17 @@ static void init_words()
 
     auto t1 = std::chrono::steady_clock::now();
 
-    std::ifstream is( fn );
-    std::string in( std::istreambuf_iterator<char>( is ), std::istreambuf_iterator<char>{} );
+    words = load_preparsed_words(std::string(fn) + ".words");
+    if (words.empty()) {
+        std::ifstream is( fn );
+        std::string in( std::istreambuf_iterator<char>( is ), std::istreambuf_iterator<char>{} );
 
-    boost::regex re( "[a-zA-Z]+");
-    boost::sregex_token_iterator it( in.begin(), in.end(), re, 0 ), end;
+        boost::regex re( "[a-zA-Z]+");
+        boost::sregex_token_iterator it( in.begin(), in.end(), re, 0 ), end;
 
-    words.assign( it, end );
+        words.assign( it, end );
+        save_preparsed_words(words, std::string(fn) + ".words");
+    }
 
     auto t2 = std::chrono::steady_clock::now();
 
@@ -264,7 +291,7 @@ template<class Map, class Mutex = null_mutex> struct single_threaded
     Map map;
     Mutex mtx;
 
-    BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_word_count(size_t num_threads, std::chrono::steady_clock::time_point & t1 )
     {
         std::size_t s = 0;
 
@@ -277,11 +304,9 @@ template<class Map, class Mutex = null_mutex> struct single_threaded
         }
 
         print_time( t1, "Word count", s, map.size() );
-
-        std::cout << std::endl;
     }
 
-    BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_contains(size_t num_threads, std::chrono::steady_clock::time_point & t1 )
     {
         std::size_t s = 0;
 
@@ -296,8 +321,6 @@ template<class Map, class Mutex = null_mutex> struct single_threaded
         }
 
         print_time( t1, "Contains", s, map.size() );
-
-        std::cout << std::endl;
     }
 };
 
@@ -308,22 +331,21 @@ template<class Mutex> struct ufm_locked
     alignas(64) boost::unordered_flat_map<std::string_view, std::size_t> map;
     alignas(64) Mutex mtx;
 
-    BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_word_count(size_t num_threads, std::chrono::steady_clock::time_point & t1 )
     {
         std::atomic<std::size_t> s = 0;
+        std::vector<std::thread> th(num_threads);
 
-        std::thread th[ Th ];
+        std::size_t m = words.size() / num_threads;
 
-        std::size_t m = words.size() / Th;
-
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
-            th[ i ] = std::thread( [this, i, m, &s]{
+            th[ i ] = std::thread( [this, i, m, num_threads, &s]{
 
                 std::size_t s2 = 0;
 
                 std::size_t start = i * m;
-                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+                std::size_t end = i == num_threads-1? words.size(): (i + 1) * m;
 
                 for( std::size_t j = start; j < end; ++j )
                 {
@@ -337,32 +359,30 @@ template<class Mutex> struct ufm_locked
             });
         }
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             th[ i ].join();
         }
 
         print_time( t1, "Word count", s, map.size() );
-
-        std::cout << std::endl;
     }
 
-    BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_contains(size_t num_threads, std::chrono::steady_clock::time_point & t1 )
     {
         std::atomic<std::size_t> s = 0;
 
-        std::thread th[ Th ];
+        std::vector<std::thread> th(num_threads);
 
-        std::size_t m = words.size() / Th;
+        std::size_t m = words.size() / num_threads;
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
-            th[ i ] = std::thread( [this, i, m, &s]{
+            th[ i ] = std::thread( [this, i, m, num_threads, &s]{
 
                 std::size_t s2 = 0;
 
                 std::size_t start = i * m;
-                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+                std::size_t end = i == num_threads-1? words.size(): (i + 1) * m;
 
                 for( std::size_t j = start; j < end; ++j )
                 {
@@ -378,14 +398,12 @@ template<class Mutex> struct ufm_locked
             });
         }
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             th[ i ].join();
         }
 
         print_time( t1, "Contains", s, map.size() );
-
-        std::cout << std::endl;
     }
 };
 
@@ -399,22 +417,22 @@ template<class Mutex> struct ufm_sharded
 {
     sync_map<Mutex> sync[ Sh ];
 
-    BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_word_count(int num_threads, std::chrono::steady_clock::time_point & t1 )
     {
         std::atomic<std::size_t> s = 0;
 
-        std::thread th[ Th ];
+        std::vector<std::thread> th(num_threads);
 
-        std::size_t m = words.size() / Th;
+        std::size_t m = words.size() / num_threads;
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
-            th[ i ] = std::thread( [this, i, m, &s]{
+            th[ i ] = std::thread( [this, i, m, num_threads, &s]{
 
                 std::size_t s2 = 0;
 
                 std::size_t start = i * m;
-                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+                std::size_t end = i == num_threads-1? words.size(): (i + 1) * m;
 
                 for( std::size_t j = start; j < end; ++j )
                 {
@@ -433,7 +451,7 @@ template<class Mutex> struct ufm_sharded
             });
         }
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             th[ i ].join();
         }
@@ -446,26 +464,24 @@ template<class Mutex> struct ufm_sharded
         }
 
         print_time( t1, "Word count", s, n );
-
-        std::cout << std::endl;
     }
 
-    BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_contains(int num_threads, std::chrono::steady_clock::time_point & t1 )
     {
         std::atomic<std::size_t> s = 0;
 
-        std::thread th[ Th ];
+        std::vector<std::thread> th(num_threads);
 
-        std::size_t m = words.size() / Th;
+        std::size_t m = words.size() / num_threads;
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
-            th[ i ] = std::thread( [this, i, m, &s]{
+            th[ i ] = std::thread( [this, i, m, num_threads, &s]{
 
                 std::size_t s2 = 0;
 
                 std::size_t start = i * m;
-                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+                std::size_t end = i == num_threads-1? words.size(): (i + 1) * m;
 
                 for( std::size_t j = start; j < end; ++j )
                 {
@@ -484,7 +500,7 @@ template<class Mutex> struct ufm_sharded
             });
         }
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             th[ i ].join();
         }
@@ -497,8 +513,6 @@ template<class Mutex> struct ufm_sharded
         }
 
         print_time( t1, "Contains", s, n );
-
-        std::cout << std::endl;
     }
 };
 
@@ -558,22 +572,22 @@ template<class Mutex> struct ufm_sharded_prehashed
 {
     sync_map_prehashed<Mutex> sync[ Sh ];
 
-    BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_word_count(size_t num_threads, std::chrono::steady_clock::time_point & t1 )
     {
         std::atomic<std::size_t> s = 0;
 
-        std::thread th[ Th ];
+        std::vector<std::thread> th(num_threads);
 
-        std::size_t m = words.size() / Th;
+        std::size_t m = words.size() / num_threads;
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
-            th[ i ] = std::thread( [this, i, m, &s]{
+            th[ i ] = std::thread( [this, i, m, num_threads, &s]{
 
                 std::size_t s2 = 0;
 
                 std::size_t start = i * m;
-                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+                std::size_t end = i == num_threads-1? words.size(): (i + 1) * m;
 
                 for( std::size_t j = start; j < end; ++j )
                 {
@@ -592,7 +606,7 @@ template<class Mutex> struct ufm_sharded_prehashed
             });
         }
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             th[ i ].join();
         }
@@ -605,26 +619,24 @@ template<class Mutex> struct ufm_sharded_prehashed
         }
 
         print_time( t1, "Word count", s, n );
-
-        std::cout << std::endl;
     }
 
-    BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_contains(size_t num_threads, std::chrono::steady_clock::time_point & t1 )
     {
         std::atomic<std::size_t> s = 0;
 
-        std::thread th[ Th ];
+        std::vector<std::thread> th(num_threads);
 
-        std::size_t m = words.size() / Th;
+        std::size_t m = words.size() / num_threads;
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
-            th[ i ] = std::thread( [this, i, m, &s]{
+            th[ i ] = std::thread( [this, i, m, num_threads, &s]{
 
                 std::size_t s2 = 0;
 
                 std::size_t start = i * m;
-                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+                std::size_t end = i == num_threads-1? words.size(): (i + 1) * m;
 
                 for( std::size_t j = start; j < end; ++j )
                 {
@@ -643,7 +655,7 @@ template<class Mutex> struct ufm_sharded_prehashed
             });
         }
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             th[ i ].join();
         }
@@ -656,8 +668,6 @@ template<class Mutex> struct ufm_sharded_prehashed
         }
 
         print_time( t1, "Contains", s, n );
-
-        std::cout << std::endl;
     }
 };
 
@@ -665,21 +675,22 @@ template<class Mutex> struct ufm_sharded_prehashed
 
 struct ufm_sharded_isolated
 {
-    struct
+    struct sync_t
     {
         alignas(64) boost::unordered_flat_map<std::string_view, std::size_t> map;
-    }
-    sync[ Th ];
+    };
+    std::vector<sync_t> sync;
 
-    BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_word_count(size_t num_threads, std::chrono::steady_clock::time_point & t1 )
     {
+        sync.resize(num_threads);
         std::atomic<std::size_t> s = 0;
 
-        std::thread th[ Th ];
+        std::vector<std::thread> th(num_threads);
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
-            th[ i ] = std::thread( [this, i, &s]{
+            th[ i ] = std::thread( [this, i, num_threads, &s]{
 
                 std::size_t s2 = 0;
 
@@ -688,7 +699,7 @@ struct ufm_sharded_isolated
                     auto const& word = words[ j ];
 
                     std::size_t hash = boost::hash<std::string_view>()( word );
-                    std::size_t shard = hash % Th;
+                    std::size_t shard = hash % num_threads;
 
                     if( shard == i )
                     {
@@ -701,32 +712,30 @@ struct ufm_sharded_isolated
             });
         }
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             th[ i ].join();
         }
 
         std::size_t n = 0;
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             n += sync[ i ].map.size();
         }
 
         print_time( t1, "Word count", s, n );
-
-        std::cout << std::endl;
     }
 
-    BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_contains(size_t num_threads, std::chrono::steady_clock::time_point & t1 )
     {
         std::atomic<std::size_t> s = 0;
 
-        std::thread th[ Th ];
+        std::vector<std::thread> th(num_threads);
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
-            th[ i ] = std::thread( [this, i, &s]{
+            th[ i ] = std::thread( [this, i, num_threads, &s]{
 
                 std::size_t s2 = 0;
 
@@ -736,7 +745,7 @@ struct ufm_sharded_isolated
                     w2.remove_prefix( 1 );
 
                     std::size_t hash = boost::hash<std::string_view>()( w2 );
-                    std::size_t shard = hash % Th;
+                    std::size_t shard = hash % num_threads;
 
                     if( shard == i )
                     {
@@ -748,41 +757,40 @@ struct ufm_sharded_isolated
             });
         }
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             th[ i ].join();
         }
 
         std::size_t n = 0;
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             n += sync[ i ].map.size();
         }
 
         print_time( t1, "Contains", s, n );
-
-        std::cout << std::endl;
     }
 };
 
 struct ufm_sharded_isolated_prehashed
 {
-    struct
+    struct sync_t
     {
         alignas(64) boost::unordered_flat_map<std::string_view, std::size_t, boost::hash<prehashed>, std::equal_to<>> map;
-    }
-    sync[ Th ];
+    };
+    std::vector<sync_t> sync;
 
-    BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_word_count(size_t num_threads, std::chrono::steady_clock::time_point & t1 )
     {
+        sync.resize(num_threads);
         std::atomic<std::size_t> s = 0;
 
-        std::thread th[ Th ];
+        std::vector<std::thread> th(num_threads);
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
-            th[ i ] = std::thread( [this, i, &s]{
+            th[ i ] = std::thread( [this, i, num_threads, &s]{
 
                 std::size_t s2 = 0;
 
@@ -791,7 +799,7 @@ struct ufm_sharded_isolated_prehashed
                     std::string_view word = words[ j ];
 
                     prehashed x( word );
-                    std::size_t shard = x.h % Th;
+                    std::size_t shard = x.h % num_threads;
 
                     if( shard == i )
                     {
@@ -804,32 +812,30 @@ struct ufm_sharded_isolated_prehashed
             });
         }
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             th[ i ].join();
         }
 
         std::size_t n = 0;
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             n += sync[ i ].map.size();
         }
 
         print_time( t1, "Word count", s, n );
-
-        std::cout << std::endl;
     }
 
-    BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_contains(size_t num_threads, std::chrono::steady_clock::time_point & t1 )
     {
         std::atomic<std::size_t> s = 0;
 
-        std::thread th[ Th ];
+        std::vector<std::thread> th(num_threads);
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
-            th[ i ] = std::thread( [this, i, &s]{
+            th[ i ] = std::thread( [this, i, num_threads, &s]{
 
                 std::size_t s2 = 0;
 
@@ -839,7 +845,7 @@ struct ufm_sharded_isolated_prehashed
                     w2.remove_prefix( 1 );
 
                     prehashed x( w2 );
-                    std::size_t shard = x.h % Th;
+                    std::size_t shard = x.h % num_threads;
 
                     if( shard == i )
                     {
@@ -851,21 +857,19 @@ struct ufm_sharded_isolated_prehashed
             });
         }
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             th[ i ].join();
         }
 
         std::size_t n = 0;
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             n += sync[ i ].map.size();
         }
 
         print_time( t1, "Contains", s, n );
-
-        std::cout << std::endl;
     }
 };
 
@@ -873,22 +877,22 @@ template<class Map> struct parallel
 {
     Map map;
 
-    BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_word_count(size_t num_threads, std::chrono::steady_clock::time_point & t1 )
     {
         std::atomic<std::size_t> s = 0;
 
-        std::thread th[ Th ];
+        std::vector<std::thread> th(num_threads);
 
-        std::size_t m = words.size() / Th;
+        std::size_t m = words.size() / num_threads;
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
-            th[ i ] = std::thread( [this, i, m, &s]{
+            th[ i ] = std::thread( [this, i, m, num_threads, &s]{
 
                 std::size_t s2 = 0;
 
                 std::size_t start = i * m;
-                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+                std::size_t end = i == num_threads-1? words.size(): (i + 1) * m;
 
                 for( std::size_t j = start; j < end; ++j )
                 {
@@ -900,32 +904,30 @@ template<class Map> struct parallel
             });
         }
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             th[ i ].join();
         }
 
         print_time( t1, "Word count", s, map.size() );
-
-        std::cout << std::endl;
     }
 
-    BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
+    BOOST_NOINLINE void test_contains(size_t num_threads, std::chrono::steady_clock::time_point & t1 )
     {
         std::atomic<std::size_t> s = 0;
 
-        std::thread th[ Th ];
+        std::vector<std::thread> th(num_threads);
 
-        std::size_t m = words.size() / Th;
+        std::size_t m = words.size() / num_threads;
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
-            th[ i ] = std::thread( [this, i, m, &s]{
+            th[ i ] = std::thread( [this, i, m, num_threads, &s]{
 
                 std::size_t s2 = 0;
 
                 std::size_t start = i * m;
-                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+                std::size_t end = i == num_threads-1? words.size(): (i + 1) * m;
 
                 for( std::size_t j = start; j < end; ++j )
                 {
@@ -939,14 +941,12 @@ template<class Map> struct parallel
             });
         }
 
-        for( std::size_t i = 0; i < Th; ++i )
+        for( std::size_t i = 0; i < num_threads; ++i )
         {
             th[ i ].join();
         }
 
         print_time( t1, "Contains", s, map.size() );
-
-        std::cout << std::endl;
     }
 };
 
@@ -960,10 +960,8 @@ struct record
 
 static std::vector<record> times;
 
-template<class Map> BOOST_NOINLINE void test( char const* label )
+template<class Map> BOOST_NOINLINE void test(int num_threads, char const* label )
 {
-    std::cout << label << ":\n\n";
-
     Map map;
 
     auto t0 = std::chrono::steady_clock::now();
@@ -971,11 +969,10 @@ template<class Map> BOOST_NOINLINE void test( char const* label )
 
     record rec = { label, 0 };
 
-    map.test_word_count( t1 );
-    map.test_contains( t1 );
+    map.test_word_count(num_threads, t1 );
+    map.test_contains(num_threads, t1 );
 
     auto tN = std::chrono::steady_clock::now();
-    std::cout << "Total: " << ( tN - t0 ) / 1ms << " ms\n\n";
 
     rec.time_ = ( tN - t0 ) / 1ms;
     times.push_back( rec );
@@ -986,41 +983,56 @@ template<class Map> BOOST_NOINLINE void test( char const* label )
 int main()
 {
     init_words();
+    bool has_printed_header = false;
 
-    test<single_threaded<ufm_map_type>>( "boost::unordered_flat_map, single threaded" );
-    // test<single_threaded<ufm_map_type, std::mutex>>( "boost::unordered_flat_map, single threaded, mutex" );
-    // test<single_threaded<ufm_map_type, std::shared_mutex>>( "boost::unordered_flat_map, single threaded, shared_mutex" );
-    test<single_threaded<ufm_map_type, rw_spinlock>>( "boost::unordered_flat_map, single threaded, rw_spinlock" );
-    test<single_threaded<cfoa_map_type>>( "concurrent_foa, single threaded" );
-    // test<single_threaded<cuckoo_map_type>>( "libcuckoo::cuckoohash_map, single threaded" );
-    test<single_threaded<tbb_map_type>>( "tbb::concurrent_hash_map, single threaded" );
-    // test<single_threaded<gtl_map_type<rw_spinlock>>>( "gtl::parallel_flat_hash_map<rw_spinlock>, single threaded" );
+    for (size_t i=1; i<=20; ++i) {
+        //test<single_threaded<ufm_map_type>>(i, "boost::unordered_flat_map, single threaded" );
+        // test<single_threaded<ufm_map_type, std::mutex>>(i,  "boost::unordered_flat_map, single threaded, mutex" );
+        // test<single_threaded<ufm_map_type, std::shared_mutex>>(i,  "boost::unordered_flat_map, single threaded, shared_mutex" );
+        //test<single_threaded<ufm_map_type, rw_spinlock>>(i, "boost::unordered_flat_map, single threaded, rw_spinlock" );
+        //test<single_threaded<cfoa_map_type>>(i, "concurrent_foa, single threaded" );
+        // test<single_threaded<cuckoo_map_type>>( i, "libcuckoo::cuckoohash_map, single threaded" );
+        //test<single_threaded<tbb_map_type>>(i, "tbb::concurrent_hash_map, single threaded" );
+        // test<single_threaded<gtl_map_type<rw_spinlock>>>(i,  "gtl::parallel_flat_hash_map<rw_spinlock>, single threaded" );
 
-    // test<ufm_locked<std::mutex>>( "boost::unordered_flat_map, locked<mutex>" );
-    // test<ufm_locked<std::shared_mutex>>( "boost::unordered_flat_map, locked<shared_mutex>" );
-    // test<ufm_locked<rw_spinlock>>( "boost::unordered_flat_map, locked<rw_spinlock>" );
+        // test<ufm_locked<std::mutex>>(i,  "boost::unordered_flat_map, locked<mutex>" );
+        // test<ufm_locked<std::shared_mutex>>( i, "boost::unordered_flat_map, locked<shared_mutex>" );
+        // test<ufm_locked<rw_spinlock>>(i,  "boost::unordered_flat_map, locked<rw_spinlock>" );
 
-    // test<ufm_sharded<std::mutex>>( "boost::unordered_flat_map, sharded<mutex>" );
-    test<ufm_sharded_prehashed<std::mutex>>( "boost::unordered_flat_map, sharded_prehashed<mutex>" );
-    // test<ufm_sharded<std::shared_mutex>>("boost::unordered_flat_map, sharded<shared_mutex>");
-    test<ufm_sharded_prehashed<std::shared_mutex>>( "boost::unordered_flat_map, sharded_prehashed<shared_mutex>" );
-    // test<ufm_sharded<rw_spinlock>>( "boost::unordered_flat_map, sharded<rw_spinlock>" );
-    test<ufm_sharded_prehashed<rw_spinlock>>( "boost::unordered_flat_map, sharded_prehashed<rw_spinlock>" );
+        // test<ufm_sharded<std::mutex>>(i,  "boost::unordered_flat_map, sharded<mutex>" );
+        //test<ufm_sharded_prehashed<std::mutex>>(i, "boost::unordered_flat_map, sharded_prehashed<mutex>" );
+        // test<ufm_sharded<std::shared_mutex>>(i, "boost::unordered_flat_map, sharded<shared_mutex>");
+        //test<ufm_sharded_prehashed<std::shared_mutex>>(i, "boost::unordered_flat_map, sharded_prehashed<shared_mutex>" );
+        // test<ufm_sharded<rw_spinlock>>(i,  "boost::unordered_flat_map, sharded<rw_spinlock>" );
+        test<ufm_sharded_prehashed<rw_spinlock>>(i, "boost::unordered_flat_map, sharded_prehashed<rw_spinlock>" );
 
-    // test<ufm_sharded_isolated>( "boost::unordered_flat_map, sharded isolated" );
-    test<ufm_sharded_isolated_prehashed>( "boost::unordered_flat_map, sharded isolated, prehashed" );
+        // test<ufm_sharded_isolated>(i,  "boost::unordered_flat_map, sharded isolated" );
+        //test<ufm_sharded_isolated_prehashed>(i, "boost::unordered_flat_map, sharded isolated, prehashed" );
 
-    test<parallel<cfoa_map_type>>( "concurrent foa" );
-    test<parallel<cuckoo_map_type>>( "libcuckoo::cuckoohash_map" );
-    test<parallel<tbb_map_type>>( "tbb::concurrent_hash_map" );
-    test<parallel<gtl_map_type<std::mutex>>>( "gtl::parallel_flat_hash_map<std::mutex>" );
-    test<parallel<gtl_map_type<std::shared_mutex>>>( "gtl::parallel_flat_hash_map<std::shared_mutex>" );
-    test<parallel<gtl_map_type<rw_spinlock>>>( "gtl::parallel_flat_hash_map<rw_spinlock>" );
+        test<parallel<cfoa_map_type>>(i, "concurrent foa" );
+        test<parallel<cuckoo_map_type>>(i, "libcuckoo::cuckoohash_map" );
+        test<parallel<tbb_map_type>>(i, "tbb::concurrent_hash_map" );
+        //test<parallel<gtl_map_type<std::mutex>>>(i, "gtl::parallel_flat_hash_map<std::mutex>" );
+        //test<parallel<gtl_map_type<std::shared_mutex>>>(i, "gtl::parallel_flat_hash_map<std::shared_mutex>" );
+        test<parallel<gtl_map_type<rw_spinlock>>>(i, "gtl::parallel_flat_hash_map<rw_spinlock>" );
 
-    std::cout << "---\n\n";
+        if (!has_printed_header) {
+            has_printed_header = true;
+            std::cout << "0;";
+            for( auto const& x: times )
+            {
+                std::cout << ";" << x.label_;
+            }
+            std::cout << std::endl;
+        }
 
-    for( auto const& x: times )
-    {
-        std::cout << std::setw( 60 ) << ( x.label_ + ": " ) << std::setw( 5 ) << x.time_ << " ms\n";
+        std::cout << i;
+        for( auto const& x: times )
+        {
+            std::cout << ";" << x.time_;
+        }
+        times.clear();
+        std::cout << std::endl;
     }
+
 }
