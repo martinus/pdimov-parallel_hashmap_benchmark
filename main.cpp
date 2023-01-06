@@ -21,6 +21,7 @@
 #include <thread>
 #include <atomic>
 #include <shared_mutex>
+#include <execution>
 #include "rw_spinlock.hpp"
 #include "cfoa.hpp"
 #include "cuckoohash_map.hh"
@@ -881,6 +882,7 @@ template<class Map> struct parallel
     {
         std::atomic<std::size_t> s = 0;
 
+#if 1
         std::vector<std::thread> th(num_threads);
 
         std::size_t m = words.size() / num_threads;
@@ -909,11 +911,18 @@ template<class Map> struct parallel
             th[ i ].join();
         }
 
+#else
+
+        std::for_each(
+            std::execution::par_unseq, words.begin(), words.end(),
+            [&](std::string const &word) { increment_element(map, word); });
+#endif
         print_time( t1, "Word count", s, map.size() );
     }
 
     BOOST_NOINLINE void test_contains(size_t num_threads, std::chrono::steady_clock::time_point & t1 )
     {
+#if 1
         std::atomic<std::size_t> s = 0;
 
         std::vector<std::thread> th(num_threads);
@@ -945,8 +954,18 @@ template<class Map> struct parallel
         {
             th[ i ].join();
         }
+#else
 
-        print_time( t1, "Contains", s, map.size() );
+        auto s =
+            std::transform_reduce(std::execution::par_unseq, words.begin(),
+                                  words.end(), std::size_t(), std::plus<>{},
+                                  [&](std::string const &word) -> std::size_t {
+                                    std::string_view w2(word);
+                                    w2.remove_prefix(1);
+                                    return contains_element(map, w2) ? 1 : 0;
+                                  });
+#endif
+        print_time(t1, "Contains", s, map.size());
     }
 };
 
@@ -985,36 +1004,11 @@ int main()
     init_words();
     bool has_printed_header = false;
 
-    for (size_t i=1; i<=20; ++i) {
-        //test<single_threaded<ufm_map_type>>(i, "boost::unordered_flat_map, single threaded" );
-        // test<single_threaded<ufm_map_type, std::mutex>>(i,  "boost::unordered_flat_map, single threaded, mutex" );
-        // test<single_threaded<ufm_map_type, std::shared_mutex>>(i,  "boost::unordered_flat_map, single threaded, shared_mutex" );
-        //test<single_threaded<ufm_map_type, rw_spinlock>>(i, "boost::unordered_flat_map, single threaded, rw_spinlock" );
-        //test<single_threaded<cfoa_map_type>>(i, "concurrent_foa, single threaded" );
-        // test<single_threaded<cuckoo_map_type>>( i, "libcuckoo::cuckoohash_map, single threaded" );
-        //test<single_threaded<tbb_map_type>>(i, "tbb::concurrent_hash_map, single threaded" );
-        // test<single_threaded<gtl_map_type<rw_spinlock>>>(i,  "gtl::parallel_flat_hash_map<rw_spinlock>, single threaded" );
-
-        // test<ufm_locked<std::mutex>>(i,  "boost::unordered_flat_map, locked<mutex>" );
-        // test<ufm_locked<std::shared_mutex>>( i, "boost::unordered_flat_map, locked<shared_mutex>" );
-        // test<ufm_locked<rw_spinlock>>(i,  "boost::unordered_flat_map, locked<rw_spinlock>" );
-
-        // test<ufm_sharded<std::mutex>>(i,  "boost::unordered_flat_map, sharded<mutex>" );
-        //test<ufm_sharded_prehashed<std::mutex>>(i, "boost::unordered_flat_map, sharded_prehashed<mutex>" );
-        // test<ufm_sharded<std::shared_mutex>>(i, "boost::unordered_flat_map, sharded<shared_mutex>");
-        //test<ufm_sharded_prehashed<std::shared_mutex>>(i, "boost::unordered_flat_map, sharded_prehashed<shared_mutex>" );
-        // test<ufm_sharded<rw_spinlock>>(i,  "boost::unordered_flat_map, sharded<rw_spinlock>" );
-        test<ufm_sharded_prehashed<rw_spinlock>>(i, "boost::unordered_flat_map, sharded_prehashed<rw_spinlock>" );
-
-        // test<ufm_sharded_isolated>(i,  "boost::unordered_flat_map, sharded isolated" );
-        //test<ufm_sharded_isolated_prehashed>(i, "boost::unordered_flat_map, sharded isolated, prehashed" );
-
-        test<parallel<cfoa_map_type>>(i, "concurrent foa" );
-        test<parallel<cuckoo_map_type>>(i, "libcuckoo::cuckoohash_map" );
-        test<parallel<tbb_map_type>>(i, "tbb::concurrent_hash_map" );
-        //test<parallel<gtl_map_type<std::mutex>>>(i, "gtl::parallel_flat_hash_map<std::mutex>" );
-        //test<parallel<gtl_map_type<std::shared_mutex>>>(i, "gtl::parallel_flat_hash_map<std::shared_mutex>" );
-        test<parallel<gtl_map_type<rw_spinlock>>>(i, "gtl::parallel_flat_hash_map<rw_spinlock>" );
+    auto t = std::vector<double>();
+    for (size_t i=0; i<1; ++i) {
+        auto num_threads = 12;
+        test<parallel<cfoa_map_type>>(num_threads, "concurrent foa" );
+        //test<parallel<tbb_map_type>>(num_threads, "tbb::concurrent_hash_map" );
 
         if (!has_printed_header) {
             has_printed_header = true;
@@ -1031,8 +1025,11 @@ int main()
         {
             std::cout << ";" << x.time_;
         }
+        t.push_back(std::chrono::duration<double>(times[0].time_).count());
         times.clear();
         std::cout << std::endl;
     }
 
+    std::sort(t.begin(), t.end());
+    std::cout << t[t.size()/2] << " median" << std::endl;
 }
